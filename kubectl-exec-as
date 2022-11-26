@@ -14,6 +14,7 @@ Options:
   -d  Enable debug mode. Print a trace of each commands
   -n  If present, the namespace scope for this CLI request
   -u  Username or UID (format: <name|uid>[:<group|gid>])
+  -g  The namespace of distination pod generatored in
   -c  Container name. If omitted, the first container in the pod will be chosen
 EOF
   exit 0
@@ -36,15 +37,18 @@ COMMAND="/bin/sh"
 USERNAME="root"
 CONTAINER="NONE"
 NAMESPACE="NONE"
+GENERATOR="default"
 
-while getopts "hdp:n:u:c:" arg; do
+while getopts "hdpg:n:u:c:" arg; do
   case $arg in
     p) # Specify pod name.
       POD=${OPTARG}
       ;;
+    g) # generatored pod running namespace, different from given pod's namespace
+      GENERATOR=${OPTARG}
+      ;;
     n) # Specify namespace
       NAMESPACE=${OPTARG}
-      KUBECTL+=" --namespace=${OPTARG}"
       ;;
     u) # Specify user
       USERNAME=${OPTARG}
@@ -82,40 +86,50 @@ if [[ $# -gt 0 ]]; then
   fi
 fi
 
-echo -e "\nConnecting...\nPod: ${POD}\nNamespace: ${NAMESPACE}\nUser: ${USERNAME}\nContainer: ${CONTAINER}\nCommand: $COMMAND\n"
+echo -e "\nConnecting...\nPod: ${POD}\nNamespace: ${NAMESPACE}\nUser: ${USERNAME}\nContainer: ${CONTAINER}\nCommand: ${COMMAND}\n"
 
-# Limits concurrent sessions (each session deploys a pod) to 2. It's not necessary, just a preference.
-test "$(exec "${KUBECTL}" get po "$(whoami|tr -dc '[:alnum:]')-1" 2>/dev/null)" && container="$(whoami|tr -dc '[:alnum:]')-2" || container="$(whoami|tr -dc '[:alnum:]')-1"
-
-# We want to mount the docker socket on the node of the pod we're exec'ing into.
-NODENAME=$( ${KUBECTL} get pod "${POD}" -o go-template='{{.spec.nodeName}}' )
-NODESELECTOR='"nodeSelector": {"kubernetes.io/hostname": "'$NODENAME'"},'
-
-# Adds toleration if the target container runs on a tainted node. Assumes no more than one taint. Change if yours have more than one or are configured differently.
-TOLERATION_VALUE=$($KUBECTL get pod "${POD}" -ojsonpath='{.spec.tolerations[].value}') >/dev/null 2>&1
-if [[ "$TOLERATION_VALUE" ]]; then
-  TOLERATION_KEY=$($KUBECTL get pod "${POD}" -ojsonpath='{.spec.tolerations[].key}')
-  TOLERATION_OPERATOR=$($KUBECTL get pod "${POD}" -ojsonpath='{.spec.tolerations[].operator}')
-  TOLERATION_EFFECT=$($KUBECTL get pod "${POD}" -ojsonpath='{.spec.tolerations[].effect}')
-  TOLERATIONS='"tolerations": [{"effect": "'$TOLERATION_EFFECT'","key": "'$TOLERATION_KEY'","operator": "'$TOLERATION_OPERATOR'","value": "'$TOLERATION_VALUE'"}],'
-else
-    TOLERATIONS=''
-fi
+container=${NAMESPACE}-${POD}-${USERNAME}
 
 if [[ ${CONTAINER} != "NONE" ]]; then
-  DOCKER_CONTAINERID=$( eval "$KUBECTL" get pod "${POD}" -o go-template="'{{ range .status.containerStatuses }}{{ if eq .name \"${CONTAINER}\" }}{{ .containerID }}{{ end }}{{ end }}'" )
+  DOCKER_CONTAINERID=$( eval "$KUBECTL" -n ${NAMESPACE} get pod "${POD}" -o go-template="'{{ range .status.containerStatuses }}{{ if eq .name \"${CONTAINER}\" }}{{ .containerID }}{{ end }}{{ end }}'" )
 else
-  DOCKER_CONTAINERID=$( $KUBECTL get pod "${POD}" -o go-template='{{ (index .status.containerStatuses 0).containerID }}' )
+  DOCKER_CONTAINERID=$( $KUBECTL -n ${NAMESPACE} get pod "${POD}" -o go-template='{{ (index .status.containerStatuses 0).containerID }}' )
 fi
 CONTAINERID=${DOCKER_CONTAINERID#*//}
 
-read -r -d '' OVERRIDES <<EOF || :
+trap '$KUBECTL -n ${GENERATOR} delete pod $container >/dev/null 2>&1 &' 0 1 2 3 15
+
+if [[ $(${KUBECTL} -n ${GENERATOR} get pod ${container} --field-selector=status.phase==Running --no-headers|wc -l) -eq 1 ]]; then
+  # if existing, then exec into it.
+  eval "${KUBECTL}" -n ${GENERATOR} exec -it "$container" -- docker exec -it -u ${USERNAME} ${CONTAINERID} $(to_json "${COMMAND}")
+else
+  # by z.s.k, if pod is exist, then reuse it instead of shown pod was existed error(will be deleted by cronjob).
+  # wheanwhile, change pod name rule with pod given name by kubectl run and -u(username) args, e.g: username-podname
+  # Limits concurrent sessions (each session deploys a pod) to 2. It's not necessary, just a preference.
+  # test "$(exec "${KUBECTL}" -n ${GENERATOR} get po "$(whoami|tr -dc '[:alnum:]')-1" 2>/dev/null)" && container="$(whoami|tr -dc '[:alnum:]')-2" || container="$(whoami|tr -dc '[:alnum:]')-1"
+
+  # We want to mount the docker socket on the node of the pod we're exec'ing into.
+  NODENAME=$( ${KUBECTL} -n ${NAMESPACE} get pod "${POD}" -o go-template='{{.spec.nodeName}}' )
+  NODESELECTOR='"nodeSelector": {"kubernetes.io/hostname": "'$NODENAME'"},'
+
+  # Adds toleration if the target container runs on a tainted node. Assumes no more than one taint. Change if yours have more than one or are configured differently.
+  TOLERATION_VALUE=$($KUBECTL -n ${NAMESPACE} get pod "${POD}" -ojsonpath='{.spec.tolerations[].value}') >/dev/null 2>&1
+  if [[ "$TOLERATION_VALUE" ]]; then
+  TOLERATION_KEY=$($KUBECTL -n ${NAMESPACE} get pod "${POD}" -ojsonpath='{.spec.tolerations[].key}')
+  TOLERATION_OPERATOR=$($KUBECTL -n ${NAMESPACE} get pod "${POD}" -ojsonpath='{.spec.tolerations[].operator}')
+  TOLERATION_EFFECT=$($KUBECTL -n ${NAMESPACE} get pod "${POD}" -ojsonpath='{.spec.tolerations[].effect}')
+  TOLERATIONS='"tolerations": [{"effect": "'$TOLERATION_EFFECT'","key": "'$TOLERATION_KEY'","operator": "'$TOLERATION_OPERATOR'","value": "'$TOLERATION_VALUE'"}],'
+  else
+      TOLERATIONS=''
+  fi
+
+  read -r -d '' OVERRIDES <<EOF || :
 {
     "apiVersion": "v1",
     "spec": {
         "containers": [
             {
-                "image": "docker",
+                "image": "harbor.local.io/k8s/docker:xxxx",
                 "name": "'$container'",
                 "stdin": true,
                 "stdinOnce": true,
@@ -123,7 +137,6 @@ read -r -d '' OVERRIDES <<EOF || :
                 "restartPolicy": "Never",
                 "args": [
                   "exec",
-                  "--privileged",
                   "-it",
                   "-u",
                   "${USERNAME}",
@@ -148,7 +161,7 @@ read -r -d '' OVERRIDES <<EOF || :
                 "name": "docker",
                 "hostPath": {
                     "path": "/var/run/docker.sock",
-                    "type": "File"
+                    "type": ""
                 }
             }
         ]
@@ -156,6 +169,6 @@ read -r -d '' OVERRIDES <<EOF || :
 }
 EOF
 
-trap '$KUBECTL delete pod $container >/dev/null 2>&1 &' 0 1 2 3 15
-
-eval "$KUBECTL" run -it --restart=Never --image=docker --overrides="'${OVERRIDES}'" "$container"
+  # by z.s.k, $container is also pod name
+  eval "$KUBECTL" -n "${GENERATOR}" run -it --restart=Never --image=harbor.local.io/k8s/docker:xxxx --overrides="'${OVERRIDES}'" "$container"
+fi
