@@ -99,7 +99,7 @@ CONTAINERID=${DOCKER_CONTAINERID#*//}
 
 trap '$KUBECTL -n ${GENERATOR} delete pod $container --ignore-not-found' 0 1 2 3 15
 
-if [[ $(${KUBECTL} -n ${GENERATOR} get pod --field-selector=status.phase==Running --no-headers >/dev/null 2>&1 | grep ${container}| wc -l) -eq 1 ]]; then
+if [[ $(${KUBECTL} -n ${GENERATOR} get pod --field-selector=status.phase==Running --no-headers 2>/dev/null | grep ${container}| wc -l) -eq 1 ]]; then
   # if existing, then exec into it.
   eval "${KUBECTL}" -n ${GENERATOR} exec -it "$container" -- docker exec -it -u ${USERNAME} ${CONTAINERID} $(to_json "${COMMAND}")
 else
